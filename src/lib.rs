@@ -1,5 +1,6 @@
 pub mod actor;
 mod b64;
+mod errors;
 pub mod messages;
 mod observer_intake;
 pub mod types;

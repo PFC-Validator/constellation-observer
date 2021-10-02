@@ -1,5 +1,6 @@
 use futures::{SinkExt, StreamExt};
 
+use crate::errors::ObserverError::{SocketBinary, SocketClosed};
 use crate::messages::{
     MessageBlockEventCommission, MessageBlockEventExchangeRate, MessageBlockEventLiveness,
     MessageBlockEventReward, MessageTX,
@@ -20,6 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 pub const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
 /// NAME of package
 pub const NAME: Option<&'static str> = option_env!("CARGO_PKG_NAME");
+
 // TODO add proposing validator to messages.
 pub async fn run(_state: AppState, connect_addr: String) {
     loop {
@@ -46,67 +48,24 @@ pub async fn run(_state: AppState, connect_addr: String) {
                         match ws_stream.send(msg).await {
                             Ok(_) => {
                                 while let Some(message) = ws_stream.next().await {
-                                    // read.for_each(|message| async {
                                     match message {
-                                        Ok(msg) => {
-                                            /*
-                                            log::info!(
-                                                "empty {} ping {} pong {} bin {} text {} close {} len {}",
-                                                msg.is_empty(),
-                                                msg.is_ping(),
-                                                msg.is_pong(),
-                                                msg.is_binary(),
-                                                msg.is_text(),
-                                                msg.is_close(),
-                                                msg.len()
-                                            );
-
-                                             */
-                                            match msg {
-                                                Message::Text(text) => {
-                                                    match serde_json::from_str::<NewBlock>(&text) {
-                                                        Ok(new_block) => {
-                                                            log::info!(
-                                                                "Block:{} {}",
-                                                                new_block.chain_id,
-                                                                new_block.data.block.header.height
-                                                            );
-                                                            if let Err(e) =
-                                                                process_block_emit(&new_block)
-                                                            {
-                                                                log::error!(
-                                                            "Error pushing block to actors: {}",
-                                                            e
-                                                        );
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            log::error!(
-                                                                "Error parsing block: {}",
-                                                                e
-                                                            );
-                                                            log::error!("{}", text);
-                                                        }
+                                        Ok(msg) => match handle_message(msg) {
+                                            Ok(exit) => {
+                                                if let Some(response) = exit {
+                                                    if let Err(e) = ws_stream.send(response).await {
+                                                        log::error!("Unable to respond  {:?}", e);
+                                                        break;
                                                     }
-                                                }
-                                                Message::Binary(_) => {}
-                                                Message::Ping(p) => {
-                                                    let pong = Message::Pong(p);
-                                                    if let Err(e) = ws_stream.send(pong).await {
-                                                        log::error!(
-                                                            "Unable to respond pong {:#?}",
-                                                            e
-                                                        )
-                                                    }
-                                                }
-                                                Message::Pong(_) => {}
-                                                Message::Close(_) => {
-                                                    log::warn!("Socket Closing..TBD do something")
                                                 }
                                             }
-                                        }
+                                            Err(e) => {
+                                                log::error!("Error Processing message {:?}", e);
+                                                break;
+                                            }
+                                        },
                                         Err(e) => {
-                                            log::error!("{:#?}", e)
+                                            log::error!("Error receiving message {:?}", e);
+                                            break;
                                         }
                                     }
                                 }
@@ -122,6 +81,41 @@ pub async fn run(_state: AppState, connect_addr: String) {
         }
         log::warn!("Observer exited..retrying in 2s");
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn handle_message(msg: Message) -> anyhow::Result<Option<Message>> {
+    match msg {
+        Message::Text(text) => match serde_json::from_str::<NewBlock>(&text) {
+            Ok(new_block) => {
+                log::info!(
+                    "Block:{} {}",
+                    new_block.chain_id,
+                    new_block.data.block.header.height
+                );
+                if let Err(e) = process_block_emit(&new_block) {
+                    log::error!("Error pushing block to actors: {}", e);
+                    Err(e)
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                log::error!("Error parsing block: {}", e);
+                log::error!("{}", text);
+                Err(anyhow::Error::from(e))
+            }
+        },
+        Message::Binary(_) => Err(SocketBinary.into()),
+        Message::Ping(p) => {
+            let pong = Message::Pong(p);
+            Ok(Some(pong))
+        }
+        Message::Pong(_) => Ok(None),
+        Message::Close(_) => {
+            log::warn!("Socket Closing..TBD do something");
+            Err(SocketClosed.into())
+        }
     }
 }
 fn process_block_emit(block: &NewBlock) -> anyhow::Result<()> {
